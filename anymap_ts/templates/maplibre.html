@@ -80,16 +80,45 @@
             };
         }
 
+        const DECK_SENTINEL_ID = '__deck-overlay-anchor';
+
         function initDeckOverlay() {
             if (deckOverlay) return;
-            deckOverlay = new MapboxOverlay({ layers: [] });
+            deckOverlay = new MapboxOverlay({ interleaved: true, layers: [] });
             map.addControl(deckOverlay);
+            // Add invisible sentinel layer as ordering anchor
+            if (!map.getLayer(DECK_SENTINEL_ID)) {
+                const sentinelSourceId = DECK_SENTINEL_ID + '-source';
+                if (!map.getSource(sentinelSourceId)) {
+                    map.addSource(sentinelSourceId, {
+                        type: 'geojson',
+                        data: { type: 'FeatureCollection', features: [] }
+                    });
+                }
+                // Insert sentinel below the first non-raster user overlay layer
+                // (skip basemap raster layers so COG renders above them)
+                const firstOverlay = addedLayers.find(l => l.type !== 'raster');
+                const sentinelBeforeId = firstOverlay ? firstOverlay.id : undefined;
+                map.addLayer({
+                    id: DECK_SENTINEL_ID,
+                    type: 'fill',
+                    source: sentinelSourceId,
+                    paint: { 'fill-opacity': 0 }
+                }, sentinelBeforeId);
+            }
         }
 
         function updateDeckOverlay() {
-            if (deckOverlay) {
-                deckOverlay.setProps({ layers: Array.from(deckLayers.values()) });
+            if (!deckOverlay) return;
+            const hasSentinel = map.getLayer(DECK_SENTINEL_ID);
+            if (hasSentinel) {
+                for (const [id, layer] of deckLayers) {
+                    if (layer.clone && (!layer.props || !layer.props.beforeId)) {
+                        deckLayers.set(id, layer.clone({ beforeId: DECK_SENTINEL_ID }));
+                    }
+                }
             }
+            deckOverlay.setProps({ layers: Array.from(deckLayers.values()) });
         }
 
         function setCOGVisibility(layerId, visible) {
@@ -306,13 +335,23 @@
                         });
                     }
                     if (!map.getLayer(sourceId)) {
-                        const layers = map.getStyle().layers || [];
-                        const firstSymbolId = layers.find(l => l.type === 'symbol')?.id;
+                        // Insert basemap above background but below deck sentinel
+                        // and user overlay layers
+                        let effectiveBeforeId;
+                        if (map.getLayer(DECK_SENTINEL_ID)) {
+                            const styleLayers = map.getStyle()?.layers || [];
+                            const si = styleLayers.findIndex(l => l.id === DECK_SENTINEL_ID);
+                            let ii = si;
+                            for (let i = si - 1; i >= 0; i--) {
+                                if (styleLayers[i].id.startsWith('@@deck.gl')) { ii = i; } else { break; }
+                            }
+                            effectiveBeforeId = styleLayers[ii]?.id;
+                        }
                         map.addLayer({
                             id: sourceId,
                             type: 'raster',
                             source: sourceId
-                        }, firstSymbolId);
+                        }, effectiveBeforeId);
                         addedLayers.push({ id: sourceId, name: name, type: 'raster' });
                     }
                     break;

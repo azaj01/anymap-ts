@@ -104,6 +104,10 @@ export class MapboxRenderer extends BaseMapRenderer<MapboxMap> {
   protected deckOverlay: MapboxOverlay | null = null;
   protected deckLayers: globalThis.Map<string, unknown> = new globalThis.Map();
 
+  // Sentinel layer ID used as ordering anchor for deck.gl layers in interleaved mode.
+  private static readonly DECK_SENTINEL_ID = '__deck-overlay-anchor';
+  private userOverlayLayerIds: string[] = [];
+
   // Zarr layers
   protected zarrLayers: globalThis.Map<string, ZarrLayer> = new globalThis.Map();
 
@@ -608,6 +612,13 @@ export class MapboxRenderer extends BaseMapRenderer<MapboxMap> {
       return;
     }
 
+    // Skip if the referenced source doesn't exist yet (it will be created
+    // when the original addGeoJSON / addFlatGeobuf call is replayed)
+    const sourceId = config.source as string | undefined;
+    if (sourceId && typeof sourceId === 'string' && !this.map.getSource(sourceId)) {
+      return;
+    }
+
     const beforeId = kwargs.beforeId as string | undefined;
     this.map.addLayer(config as mapboxgl.AnyLayer, beforeId);
     this.stateManager.addLayer(config.id, config);
@@ -714,8 +725,23 @@ export class MapboxRenderer extends BaseMapRenderer<MapboxMap> {
     }
 
     if (!this.map.getLayer(layerId)) {
-      const layers = this.map.getStyle().layers || [];
-      const firstSymbolId = layers.find((l) => l.type === 'symbol')?.id;
+      // Insert basemap above background layers but below the deck sentinel
+      // and user overlay layers.
+      let effectiveBeforeId: string | undefined;
+      const sentinel = MapboxRenderer.DECK_SENTINEL_ID;
+      if (this.map.getLayer(sentinel)) {
+        const styleLayers = this.map.getStyle()?.layers || [];
+        const sentinelIdx = styleLayers.findIndex((l: { id: string }) => l.id === sentinel);
+        let insertIdx = sentinelIdx;
+        for (let i = sentinelIdx - 1; i >= 0; i--) {
+          if ((styleLayers[i] as { id: string }).id.startsWith('@@deck.gl')) {
+            insertIdx = i;
+          } else {
+            break;
+          }
+        }
+        effectiveBeforeId = (styleLayers[insertIdx] as { id: string })?.id;
+      }
 
       this.map.addLayer(
         {
@@ -723,7 +749,7 @@ export class MapboxRenderer extends BaseMapRenderer<MapboxMap> {
           type: 'raster',
           source: sourceId,
         },
-        firstSymbolId
+        effectiveBeforeId
       );
     }
   }
@@ -770,6 +796,8 @@ export class MapboxRenderer extends BaseMapRenderer<MapboxMap> {
         source: sourceId,
         paint: layerPaint,
       });
+      // Track as user overlay layer for deck.gl ordering
+      this.userOverlayLayerIds.push(layerId);
     }
 
     if (fitBounds && kwargs.bounds) {
@@ -1258,19 +1286,52 @@ export class MapboxRenderer extends BaseMapRenderer<MapboxMap> {
     if (this.deckOverlay || !this.map) return;
 
     this.deckOverlay = new MapboxOverlay({
+      interleaved: true,
       layers: [],
     });
     this.map.addControl(this.deckOverlay as unknown as mapboxgl.IControl);
+
+    // Add an invisible sentinel layer as an ordering anchor.
+    if (!this.map.getLayer(MapboxRenderer.DECK_SENTINEL_ID)) {
+      const sentinelSourceId = `${MapboxRenderer.DECK_SENTINEL_ID}-source`;
+      if (!this.map.getSource(sentinelSourceId)) {
+        this.map.addSource(sentinelSourceId, {
+          type: 'geojson',
+          data: { type: 'FeatureCollection', features: [] },
+        });
+      }
+      const insertBefore = this.userOverlayLayerIds.find(
+        (id) => this.map?.getLayer(id)
+      );
+      this.map.addLayer({
+        id: MapboxRenderer.DECK_SENTINEL_ID,
+        type: 'fill',
+        source: sentinelSourceId,
+        paint: { 'fill-opacity': 0 },
+      } as mapboxgl.AnyLayer, insertBefore);
+    }
   }
 
   /**
    * Update deck.gl overlay with current layers.
    */
   private updateDeckOverlay(): void {
-    if (this.deckOverlay) {
-      const layers = Array.from(this.deckLayers.values()) as (false | null | undefined)[];
-      this.deckOverlay.setProps({ layers });
+    if (!this.deckOverlay) return;
+
+    const sentinelId = MapboxRenderer.DECK_SENTINEL_ID;
+    const hasSentinel = this.map?.getLayer(sentinelId);
+
+    if (hasSentinel) {
+      for (const [id, layer] of this.deckLayers) {
+        const typedLayer = layer as { clone?: (props: Record<string, unknown>) => unknown; props?: { beforeId?: string } };
+        if (typedLayer.clone && !typedLayer.props?.beforeId) {
+          this.deckLayers.set(id, typedLayer.clone({ beforeId: sentinelId }));
+        }
+      }
     }
+
+    const layers = Array.from(this.deckLayers.values()) as (false | null | undefined)[];
+    this.deckOverlay.setProps({ layers });
   }
 
   private handleAddCOGLayer(args: unknown[], kwargs: Record<string, unknown>): void {
